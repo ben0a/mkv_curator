@@ -1,0 +1,36 @@
+# mkv_curator v0.8 default config
+
+[paths]
+output_dir = "/Users/yourusername/output" # change it to whatever you want
+ffmpeg_bin = "/opt/homebrew/bin/ffmpeg"
+ffprobe_bin = "/opt/homebrew/bin/ffprobe"
+
+[video]
+sdr_encoder = "videotoolbox_8bit"   # videotoolbox_8bit | videotoolbox_10bit | libx265_10bit
+hdr_encoder = "videotoolbox_10bit"  # videotoolbox_10bit | libx265_10bit
+dovi_policy = "videotoolbox_10bit"  # videotoolbox_10bit | libx265_10bit | skip
+vt_quality = 60
+x265_preset = "slow"
+x265_crf_hdr = 20
+# force_encoder = "libx265_10bit"
+
+[audio]
+keep_languages = ["fra", "eng"]
+mode = "stereo_plus_multichannel"
+
+[subtitles]
+keep_languages = ["fra", "eng"]
+mode = "forced_and_full"
+allow_sdh_fallback = false
+
+[behavior]
+recursive = false
+resume = false
+mp4_chapters = "drop"   # keep | drop
+map_metadata = false
+
+[report]
+console_style = "rich"  # rich | plain
+write_json = true
+write_jsonl = true
+report_filename = "mkv_curator_report.json"
