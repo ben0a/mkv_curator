@@ -699,21 +699,6 @@ def parse_time_str(t: str) -> float:
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
     return 0.0
 
-def estimate_eta(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
-    """Eta = estimated remaining time at current speed."""
-    if not progress.speed or progress.speed < 0.1:
-        return "?"
-    remaining = elapsed_sec / (progress.speed - 1) if progress.speed > 1 else 0
-    return format_time(remaining)
-
-def estimate_total(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
-    if not progress.speed or progress.speed < 0.1:
-        return "?"
-    total = elapsed_sec + estimate_eta(elapsed_sec, progress) if not isinstance(estimate_eta(elapsed_sec, progress), str) else None
-    if total is not None:
-        return format_time(total)
-    return "?"
-
 def progress_pct(progress: ConversionProgress, total_frames: int) -> float:
     if not total_frames or not progress.frame:
         return 0.0
@@ -1352,8 +1337,8 @@ def main() -> int:
         print_effective_config(eff, config_path)
         return 0
 
-    ffmpeg_ok = Path(eff["ffmpeg_bin"]).exists() or shutil.which(eff["ffmpeg_bin"])
-    ffprobe_ok = Path(eff["ffprobe_bin"]).exists() or shutil.which(eff["ffprobe_bin"])
+    ffmpeg_ok = shutil.which(eff["ffmpeg_bin"]) is not None or Path(eff["ffmpeg_bin"]).exists()
+    ffprobe_ok = shutil.which(eff["ffprobe_bin"]) is not None or Path(eff["ffprobe_bin"]).exists()
     if not ffmpeg_ok:
         print(f"ffmpeg not found: {eff['ffmpeg_bin']}", file=sys.stderr); return 2
     if not ffprobe_ok:
@@ -1362,7 +1347,11 @@ def main() -> int:
     inp = Path(args.input)
     output_dir = Path(eff["output_dir"]) if eff["output_dir"] else None
     root = output_root_for(inp, output_dir)
-    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Error: cannot create output directory {root}: {e}", file=sys.stderr)
+        return 2
     sfile = state_file(root); lfile = log_file(root)
 
     # Read existing state for resume
@@ -1398,7 +1387,10 @@ def main() -> int:
         if eff["resume"] and prev_entry.get("status") in (FileState.RUNNING, FileState.PAUSED):
             if dst.exists():
                 print(f"Removing corrupt output from previous crash: {dst}")
-                dst.unlink()
+                try:
+                    dst.unlink()
+                except OSError as e:
+                    print(f"Warning: could not remove corrupt output {dst}: {e}", file=sys.stderr)
 
         # Skip if already done (output exists)
         if not eff["resume"] and dst.exists():
@@ -1420,7 +1412,9 @@ def main() -> int:
                 cmd = build_cmd(eff["ffmpeg_bin"], src, dst, plan, args.audio_codec, eff)
                 print("  Planned command:")
                 print("   ", " ".join(cmd)); print()
-                row = {"src": str(src), "dst": str(dst), "status": "planned"}
+                row = {"src": str(src), "dst": str(dst), "status": "planned",
+                       "classification": plan["classification"], "encoder_key": plan["encoder_key"],
+                       "has_dovi": plan["has_dovi"], "is_hdr": plan["is_hdr"]}
                 results.append(row)
                 continue
 
