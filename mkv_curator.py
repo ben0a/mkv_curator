@@ -555,7 +555,9 @@ def _read_ffmpeg_stderr(rd_fd: int, progress: ConversionProgress,
 def convert_one(src: Path, dst: Path, eff: Dict[str, Any], audio_codec: str,
                 sfile: Path, lfile: Path,
                 on_progress: Optional[Callable] = None,
-                pause_event: Optional[threading.Event] = None) -> Dict[str, Any]:
+                pause_event: Optional[threading.Event] = None,
+                meta: Optional[Dict[str, Any]] = None,
+                plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Process a single MKV file. Returns result dict."""
     started = time.time()
     row: Dict[str, Any] = {"src": str(src), "ts_start": now_iso(), "dst": str(dst)}
@@ -564,8 +566,10 @@ def convert_one(src: Path, dst: Path, eff: Dict[str, Any], audio_codec: str,
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
 
-        meta = ffprobe_json(eff["ffprobe_bin"], src)
-        plan = build_plan(meta, eff)
+        if meta is None:
+            meta = ffprobe_json(eff["ffprobe_bin"], src)
+        if plan is None:
+            plan = build_plan(meta, eff)
         row.update({"classification": plan["classification"], "encoder_key": plan["encoder_key"],
                      "has_dovi": plan["has_dovi"], "is_hdr": plan["is_hdr"]})
 
@@ -629,6 +633,7 @@ def convert_one(src: Path, dst: Path, eff: Dict[str, Any], audio_codec: str,
             reader_thread.join(timeout=2)
 
         if INTERRUPTED:
+            row["status"] = "interrupted"
             update_file_state(sfile, src, dst, "interrupted")
             return row
 
@@ -752,9 +757,9 @@ def print_effective_config(eff: Dict[str, Any], config_path: Path) -> None:
 
 def summarize(results: List[Dict[str, Any]], report_path: Optional[Path], console_style: str) -> None:
     total = len(results)
-    converted = sum(1 for r in results if r["status"] == FileState.DONE)
-    failed = sum(1 for r in results if r["status"] == FileState.FAILED)
-    skipped = sum(1 for r in results if r["status"].startswith("skipped"))
+    converted = sum(1 for r in results if r.get("status") == FileState.DONE)
+    failed = sum(1 for r in results if r.get("status") == FileState.FAILED)
+    skipped = sum(1 for r in results if (r.get("status") or "").startswith("skipped"))
     dovi = [r for r in results if r.get("has_dovi")]
     dovi_vt = [r for r in dovi if r.get("encoder_key") == "videotoolbox_10bit"]
     warnings = [r for r in results if r.get("warning")]
@@ -1020,21 +1025,39 @@ def _make_tui_app():
                 if not entry.dst:
                     entry.dst = str(dst)
 
-                self.call_from_thread(self._on_file_running, idx)
+                # Run ffprobe in worker thread to avoid blocking the UI
+                try:
+                    meta = ffprobe_json(self.eff["ffprobe_bin"], entry.src)
+                    plan = build_plan(meta, self.eff)
+                    video_stream = plan.get("video", {})
+                    fps_str = video_stream.get("r_frame_rate", "25/1")
+                    if "/" in fps_str:
+                        num, den = fps_str.split("/")
+                        est_fps = float(num) / max(1, int(den))
+                    else:
+                        est_fps = float(fps_str) if fps_str else 25.0
+                    duration_str = meta.get("format", {}).get("duration", "0")
+                    total_frames = max(1, int(float(duration_str) * est_fps))
+                except Exception:
+                    meta = plan = None
+                    total_frames = 100000
+
+                self.call_from_thread(self._on_file_running, idx, plan, total_frames)
 
                 prev_frame = 0
-                def on_progress(prog: ConversionProgress) -> None:
+                def on_progress(prog: ConversionProgress, _idx: int = idx) -> None:
                     nonlocal prev_frame
                     if prog.frame > prev_frame:
                         prev_frame = prog.frame
-                        self.call_from_thread(self._on_progress_update, idx, prog)
+                        self.call_from_thread(self._on_progress_update, _idx, prog)
 
                 try:
                     row = convert_one(
                         entry.src, dst, self.eff, self.audio_codec,
                         self.sfile, self.lfile,
                         on_progress=on_progress,
-                        pause_event=self.pause_event)
+                        pause_event=self.pause_event,
+                        meta=meta, plan=plan)
 
                     entry.status = row.get("status", FileState.FAILED)
                     entry.classification = row.get("classification", "")
@@ -1054,40 +1077,18 @@ def _make_tui_app():
             self.running = False
             self.call_from_thread(self._on_batch_done)
 
-        def _on_file_running(self, idx: int) -> None:
+        def _on_file_running(self, idx: int, plan: Optional[dict], total_frames: int) -> None:
             entry = self.queue[idx]
-            try:
-                meta = ffprobe_json(self.eff["ffprobe_bin"], entry.src)
-                plan = build_plan(meta, self.eff)
-                entry.classification = plan["classification"]
-                entry.encoder_key = plan["encoder_key"]
-                entry.has_dovi = plan["has_dovi"]
-                entry.is_hdr = plan["is_hdr"]
-
-                video_stream = plan.get("video", {})
-                fps_str = video_stream.get("r_frame_rate", "25/1")
-                if "/" in fps_str:
-                    num, den = fps_str.split("/")
-                    try:
-                        est_fps = float(num) / max(1, int(den))
-                    except ValueError:
-                        est_fps = 25.0
-                else:
-                    try:
-                        est_fps = float(fps_str)
-                    except ValueError:
-                        est_fps = 25.0
-
-                duration_str = meta.get("format", {}).get("duration", "0")
-                self.total_frames = max(1, int(float(duration_str) * est_fps))
-
-            except Exception:
-                self.total_frames = 100000
-
+            if plan:
+                entry.classification = plan.get("classification", "")
+                entry.encoder_key = plan.get("encoder_key", "")
+                entry.has_dovi = plan.get("has_dovi", False)
+                entry.is_hdr = plan.get("is_hdr", False)
+            self.total_frames = max(1, total_frames)
             entry.status = FileState.RUNNING
             self.progress = ConversionProgress()
-            self._render_file_list()
             self._set_detail(entry)
+            self._render_file_list()
 
         def _on_progress_update(self, idx: int, prog: ConversionProgress) -> None:
             pct = progress_pct(prog, self.total_frames) if self.total_frames else 0.0
