@@ -643,6 +643,7 @@ def convert_one(src: Path, dst: Path, eff: Dict[str, Any], audio_codec: str,
         if INTERRUPTED:
             row["status"] = "interrupted"
             update_file_state(sfile, src, dst, "interrupted")
+            row['status'] = 'interrupted'
             return row
 
         if rc != 0:
