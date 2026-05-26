@@ -1,22 +1,25 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["rich>=13.9.0"]
+# dependencies = ["rich>=13.9.0", "textual>=0.69.0"]
 # ///
 
 import argparse
 import json
+import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 APP_NAME = "mkv_curator"
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / APP_NAME / "config.toml"
 TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "text", "mov_text"}
 BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "pgs", "dvd_subtitle", "xsub", "dvb_subtitle"}
@@ -26,6 +29,36 @@ CURRENT_DST: Optional[str] = None
 CURRENT_PROC: Optional[subprocess.Popen] = None
 CURRENT_STATE_PATH: Optional[Path] = None
 CURRENT_LOG_PATH: Optional[Path] = None
+
+# Regex to parse FFmpeg progress line from stderr
+FFMPEG_PROGRESS_RE = re.compile(
+    r"frame=(\d+)\s+fps=([\d.]+)\s+q=(-?\d+\.\d+|-?\d)\s+"
+    r"(?:size=\s*(\d+)KiB\s*)?"
+    r"time=(\d+:\d+:\d+\.\d+)\s*"
+    r"bitrate=\s*([\d.]+|N/A)\s*kbits/s\s*"
+    r"(?:speed=\s*([\d.]+|N/A)\s*x)?"
+)
+
+# Progress data passed to callbacks
+class ConversionProgress:
+    def __init__(self):
+        self.frame = 0
+        self.fps = 0.0
+        self.speed = 1.0
+        self.size_kib = 0.0
+        self.time_str = "0:00:00.0"
+        self.bitrate_kbps = 0.0
+
+# File status in the processing queue
+class FileState:
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    PAUSED = "paused"
+    DONE = "done"
+    SKIPPED_EXISTS = "skipped_exists"
+    SKIPPED_DOVI = "skipped_dovi_policy"
+    FAILED = "failed"
 
 try:
     import tomllib
@@ -40,6 +73,19 @@ except Exception:
     Console = None
     Table = None
     Panel = None
+
+
+def _load_textual():
+    """Lazy-import textual only when TUI mode is used."""
+    try:
+        from textual.app import App, ComposeResult
+        from textual.binding import Binding
+        from textual.containers import Container
+        from textual.widgets import Footer, Header, Label, ProgressBar, Static, RichLog
+        return App, ComposeResult, Binding, Container, Footer, Header, Label, ProgressBar, Static, RichLog
+    except ImportError:
+        print("textual not installed; run 'uv pip install textual'", file=sys.stderr)
+        sys.exit(2)
 
 
 def now_iso() -> str:
@@ -460,6 +506,157 @@ def report_lines(src: Path, dst: Path, plan: Dict[str, Any], eff: Dict[str, Any]
     return lines
 
 
+def parse_progress_line(line: str, progress: ConversionProgress) -> None:
+    m = FFMPEG_PROGRESS_RE.search(line.strip())
+    if not m:
+        return
+    progress.frame = int(m.group(1))
+    progress.fps = float(m.group(2))
+    if m.group(4):
+        progress.size_kib = int(m.group(4))
+    if m.group(5):
+        progress.time_str = m.group(5)
+    if m.group(6) and m.group(6) != "N/A":
+        progress.bitrate_kbps = float(m.group(6))
+    if m.group(7) and m.group(7) != "N/A":
+        progress.speed = float(m.group(7))
+
+def _read_ffmpeg_stderr(rd_fd: int, progress: ConversionProgress,
+                         on_progress: Optional[Callable], pause_event: threading.Event) -> None:
+    """Background thread that reads FFmpeg stderr and fires progress callbacks."""
+    import os
+    buf = b""
+    try:
+        while True:
+            chunk = os.read(rd_fd, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line_bytes, buf = buf.split(b"\n", 1)
+                try:
+                    line = line_bytes.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if "frame=" in line and "fps=" in line and "time=" in line:
+                    parse_progress_line(line, progress)
+                    if on_progress:
+                        while pause_event.is_set():
+                            time.sleep(0.1)
+                        on_progress(progress)
+
+                # Still write line to /dev/null (we don't want it cluttering the TUI)
+    except OSError:
+        pass
+    except Exception:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+
+def convert_one(src: Path, dst: Path, eff: Dict[str, Any], audio_codec: str,
+                sfile: Path, lfile: Path,
+                on_progress: Optional[Callable] = None,
+                pause_event: Optional[threading.Event] = None) -> Dict[str, Any]:
+    """Process a single MKV file. Returns result dict."""
+    started = time.time()
+    row: Dict[str, Any] = {"src": str(src), "ts_start": now_iso(), "dst": str(dst)}
+    progress = ConversionProgress()
+
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        meta = ffprobe_json(eff["ffprobe_bin"], src)
+        plan = build_plan(meta, eff)
+        row.update({"classification": plan["classification"], "encoder_key": plan["encoder_key"],
+                     "has_dovi": plan["has_dovi"], "is_hdr": plan["is_hdr"]})
+
+        if plan["encoder_key"] == "skip":
+            row.update({"status": FileState.SKIPPED_DOVI, "warning": "DOVI file skipped by policy"})
+            update_file_state(sfile, src, dst, FileState.SKIPPED_DOVI,
+                              {"classification": plan["classification"], "encoder_key": plan["encoder_key"]})
+            append_log(lfile, {"event": FileState.SKIPPED_DOVI, "src": str(src), "dst": str(dst),
+                                "classification": plan["classification"]})
+            row["elapsed_sec"] = round(time.time() - started, 2)
+            row["ts_end"] = now_iso()
+            return row
+
+        cmd = build_cmd(eff["ffmpeg_bin"], src, dst, plan, audio_codec, eff)
+        append_log(lfile, {"event": "planned", "src": str(src), "dst": str(dst),
+                            "classification": plan["classification"], "encoder_key": plan["encoder_key"]})
+
+        update_file_state(sfile, src, dst, FileState.RUNNING)
+        append_log(lfile, {"event": "running", "src": str(src), "dst": str(dst)})
+
+        global CURRENT_SRC, CURRENT_DST, CURRENT_PROC, CURRENT_STATE_PATH, CURRENT_LOG_PATH
+        CURRENT_SRC = str(src); CURRENT_DST = str(dst)
+        CURRENT_STATE_PATH = sfile; CURRENT_LOG_PATH = lfile
+
+        # Spawn FFmpeg with stderr piped for progress parsing (TUI) or DEVNULL (CLI)
+        stderr_target = subprocess.PIPE if on_progress else subprocess.DEVNULL
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_target)
+        CURRENT_PROC = proc
+
+        # Start background thread to read stderr
+        reader_thread = None
+        if on_progress:
+            pipe_fd = proc.stderr.fileno() if proc.stderr else -1
+            reader_thread = threading.Thread(
+                target=_read_ffmpeg_stderr, args=(pipe_fd, progress, on_progress, pause_event or threading.Event()),
+                daemon=True)
+            reader_thread.start()
+
+        # Handle pause/resume during wait
+        check_interval = 0.25
+        while proc.poll() is None:
+            time.sleep(check_interval)
+            if pause_event and pause_event.is_set():
+                if proc.poll() is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGSTOP)
+                    except Exception:
+                        pass
+                update_file_state(sfile, src, dst, FileState.PAUSED)
+            else:
+                if proc.poll() is None:
+                    try:
+                        os.kill(proc.pid, signal.SIGCONT)
+                    except Exception:
+                        pass
+
+        rc = proc.returncode or 0
+        CURRENT_PROC = None
+
+        if reader_thread:
+            reader_thread.join(timeout=2)
+
+        if INTERRUPTED:
+            update_file_state(sfile, src, dst, "interrupted")
+            return row
+
+        if rc != 0:
+            row.update({"status": FileState.FAILED, "returncode": rc})
+            update_file_state(sfile, src, dst, FileState.FAILED, {"returncode": rc})
+            append_log(lfile, {"event": "failed", "src": str(src), "dst": str(dst), "returncode": rc})
+        else:
+            row.update({"status": FileState.DONE, "output_size_mb": sizeof_mb(dst),
+                         "frames_encoded": progress.frame, "avg_speed": round(progress.speed, 2)})
+            probe_out = ffprobe_json(eff["ffprobe_bin"], dst)
+            has_data_stream = any(s.get("codec_type") == "data" for s in probe_out.get("streams", []))
+            if has_data_stream:
+                row["warning"] = "output still contains data stream"
+            update_file_state(sfile, src, dst, FileState.DONE)
+            append_log(lfile, {"event": "done", "src": str(src), "dst": str(dst),
+                                "warning": row.get("warning")})
+
+        row["elapsed_sec"] = round(time.time() - started, 2)
+        row["ts_end"] = now_iso()
+        return row
+
+    except Exception as exc:
+        row.update({"status": FileState.FAILED, "error": str(exc),
+                     "elapsed_sec": round(time.time() - started, 2), "ts_end": now_iso()})
+        append_log(lfile, {"event": "error", "src": str(src), "error": str(exc)})
+        raise
+
 def handle_interrupt(signum, frame):
     global INTERRUPTED, CURRENT_PROC, CURRENT_SRC, CURRENT_DST, CURRENT_STATE_PATH, CURRENT_LOG_PATH
     INTERRUPTED = True
@@ -468,11 +665,57 @@ def handle_interrupt(signum, frame):
     if CURRENT_LOG_PATH and CURRENT_SRC and CURRENT_DST:
         append_log(CURRENT_LOG_PATH, {"event": "interrupted", "src": CURRENT_SRC, "dst": CURRENT_DST})
     if CURRENT_PROC and CURRENT_PROC.poll() is None:
-        CURRENT_PROC.send_signal(signal.SIGINT)
-
+        try:
+            os.kill(CURRENT_PROC.pid, signal.SIGSTOP)
+        except Exception:
+            pass
 
 def sizeof_mb(path: Path) -> Optional[float]:
     return round(path.stat().st_size / (1024 * 1024), 2) if path.exists() else None
+
+def format_time(s: float) -> str:
+    m, s2 = divmod(int(s), 60)
+    h, m2 = divmod(m, 60)
+    if h:
+        return f"{h}:{m2:02d}:{s2:02d}"
+    return f"{m2:02d}:{s2:02d}"
+
+def parse_time_str(t: str) -> float:
+    parts = t.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    return 0.0
+
+def estimate_eta(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
+    """Eta = estimated remaining time at current speed."""
+    if not progress.speed or progress.speed < 0.1:
+        return "?"
+    remaining = elapsed_sec / (progress.speed - 1) if progress.speed > 1 else 0
+    return format_time(remaining)
+
+def estimate_total(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
+    if not progress.speed or progress.speed < 0.1:
+        return "?"
+    total = elapsed_sec + estimate_eta(elapsed_sec, progress) if not isinstance(estimate_eta(elapsed_sec, progress), str) else None
+    if total is not None:
+        return format_time(total)
+    return "?"
+
+def progress_pct(progress: ConversionProgress, total_frames: int) -> float:
+    if not total_frames or not progress.frame:
+        return 0.0
+    return min(100.0, (progress.frame / total_frames) * 100.0)
+
+def estimate_total_time(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
+    """Estimate total time remaining at current speed."""
+    if not progress.speed or progress.speed < 0.1:
+        return "?"
+    if progress.speed <= 1:
+        return "?"
+    remaining = elapsed_sec / (progress.speed - 1)
+    if remaining > 99999:
+        return "?"
+    return format_time(remaining)
 
 
 def effective_settings(args, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -499,7 +742,8 @@ def effective_settings(args, cfg: Dict[str, Any]) -> Dict[str, Any]:
     report_filename = args.report_filename if args.report_filename is not None else cfg_get(cfg, "report", "report_filename", f"{APP_NAME}_report.json")
     mp4_chapters = args.mp4_chapters if args.mp4_chapters is not None else cfg_get(cfg, "behavior", "mp4_chapters", "drop")
     map_metadata = as_bool(args.map_metadata if args.map_metadata is not None else cfg_get(cfg, "behavior", "map_metadata", False), False)
-    return {"output_dir": output_dir, "ffmpeg_bin": ffmpeg_bin, "ffprobe_bin": ffprobe_bin, "recursive": recursive, "resume": resume, "dry_run": args.dry_run, "vt_quality": vt_quality, "x265_preset": x265_preset, "x265_crf_hdr": x265_crf_hdr, "sdr_encoder": sdr_encoder, "hdr_encoder": hdr_encoder, "dovi_policy": dovi_policy, "force_encoder": force_encoder, "audio_mode": audio_mode, "subtitle_mode": subtitle_mode, "keep_audio_langs": keep_audio_langs, "keep_sub_langs": keep_sub_langs, "allow_sdh_fallback": allow_sdh_fallback, "console_style": console_style, "write_json": write_json, "write_jsonl": write_jsonl, "report_filename": report_filename, "mp4_chapters": mp4_chapters, "map_metadata": map_metadata}
+    use_tui = not args.plain and as_bool(cfg_get(cfg, "report", "tui", True), True)
+    return {"output_dir": output_dir, "ffmpeg_bin": ffmpeg_bin, "ffprobe_bin": ffprobe_bin, "recursive": recursive, "resume": resume, "dry_run": args.dry_run, "vt_quality": vt_quality, "x265_preset": x265_preset, "x265_crf_hdr": x265_crf_hdr, "sdr_encoder": sdr_encoder, "hdr_encoder": hdr_encoder, "dovi_policy": dovi_policy, "force_encoder": force_encoder, "audio_mode": audio_mode, "subtitle_mode": subtitle_mode, "keep_audio_langs": keep_audio_langs, "keep_sub_langs": keep_sub_langs, "allow_sdh_fallback": allow_sdh_fallback, "console_style": console_style, "write_json": write_json, "write_jsonl": write_jsonl, "report_filename": report_filename, "mp4_chapters": mp4_chapters, "map_metadata": map_metadata, "use_tui": use_tui}
 
 
 def print_effective_config(eff: Dict[str, Any], config_path: Path) -> None:
@@ -508,8 +752,8 @@ def print_effective_config(eff: Dict[str, Any], config_path: Path) -> None:
 
 def summarize(results: List[Dict[str, Any]], report_path: Optional[Path], console_style: str) -> None:
     total = len(results)
-    converted = sum(1 for r in results if r["status"] == "done")
-    failed = sum(1 for r in results if r["status"] == "failed")
+    converted = sum(1 for r in results if r["status"] == FileState.DONE)
+    failed = sum(1 for r in results if r["status"] == FileState.FAILED)
     skipped = sum(1 for r in results if r["status"].startswith("skipped"))
     dovi = [r for r in results if r.get("has_dovi")]
     dovi_vt = [r for r in dovi if r.get("encoder_key") == "videotoolbox_10bit"]
@@ -562,6 +806,490 @@ def write_reports(root: Path, results: List[Dict[str, Any]], eff: Dict[str, Any]
     return report_path if eff["write_json"] else None
 
 
+# ──────────────────────── TUI (Textual) ────────────────────────
+
+class _QueueEntry:
+    def __init__(self, src: Path):
+        self.src = src
+        self.status = FileState.PENDING
+        self.dst: str = ""
+        self.classification: str = ""
+        self.encoder_key: str = ""
+        self.has_dovi: bool = False
+        self.is_hdr: bool = False
+        self.error: str = ""
+        self.elapsed_sec: float = 0.0
+
+def _make_tui_app():
+    """Factory that returns the TUI App class. Defined here so textual is only imported when needed."""
+    App, ComposeResult, Binding, Container, Footer, Header, Label, ProgressBarTui, Static, RichLog = _load_textual()
+
+    CSS_CODE = """
+    Screen {
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 35% 65%;
+    }
+
+    #left-panel {
+        border: solid green;
+        padding: 1;
+        background: $surface;
+    }
+
+    #right-panel {
+        border: solid blue;
+        padding: 1;
+        background: $surface;
+    }
+
+    #queue-banner {
+        dock: bottom;
+        height: 1;
+        content-align: center middle;
+    }
+
+    #stats-header {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #progress-section {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #metrics-section {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #detail-section {
+        height: auto;
+        border-top: solid $accent;
+        padding-top: 1;
+    }
+
+    ProgressBar {
+        height: 3;
+        border: blank;
+    }
+
+    .file-done { color: green; }
+    .file-failed { color: red; }
+    .file-paused { color: yellow; text-style: bold; }
+    .file-running { color: cyan; text-style: bold; }
+    .file-pending { color: $text-muted; }
+
+    #pause-overlay {
+        display: none;
+        dock: top;
+        height: 2;
+        content-align: center middle;
+        background: $surface-darken-3;
+        color: yellow;
+        text-style: bold;
+    }
+
+    #pause-overlay.visible { display: block; }
+"""
+
+    class _CuratorTui(App[None]):
+        BINDINGS = [
+            Binding("q", "quit", "Quit batch"),
+            Binding("space", "pause_resume", "Pause / Resume"),
+            Binding("r", "restart_file", "Restart current file"),
+        ]
+
+        CSS = CSS_CODE
+
+        def __init__(self, inp_root: Path, files: List[Path], output_dir: Optional[Path],
+                     root: Path, sfile: Path, lfile: Path, eff: Dict[str, Any],
+                     audio_codec: str, prev_files: Dict[str, Any]):
+            super().__init__()
+            self.inp_root = inp_root
+            self.files_init = files
+            self.output_dir = output_dir
+            self.root = root
+            self.sfile = sfile
+            self.lfile = lfile
+            self.eff = eff
+            self.audio_codec = audio_codec
+            self.queue: List[_QueueEntry] = []
+            self.current_idx: int = -1
+            self.pause_event = threading.Event()
+            self.running = False
+            self.cancelled = False
+            self.progress = ConversionProgress()
+            self.total_frames: int = 0
+            self.prev_files = prev_files
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            with Container(id="left-panel"):
+                yield Label("  FILES TO PROCESS", id="left-title")
+                yield Static("", id="file-list")
+                yield Label("", id="queue-banner", classes="file-pending")
+            with Container(id="right-panel"):
+                yield Label("  PAUSED — press Space to resume", id="pause-overlay")
+                yield Static("", id="stats-header")
+                with Container(id="progress-section"):
+                    yield ProgressBarTui(total=100, show_eta=True)
+                with Container(id="metrics-section"):
+                    yield Label("", id="metric-fps")
+                    yield Label("", id="metric-speed")
+                    yield Label("", id="metric-bitrate")
+                with Container(id="detail-section"):
+                    yield Static("", id="detail-classification")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.build_queue()
+            self.query_one("#left-panel").styles.height = "100%"
+            self.query_one("#right-panel").styles.height = "100%"
+            self._start_file_watcher()
+            self._run_worker_thread()
+
+        def _start_file_watcher(self) -> None:
+            t = threading.Thread(target=self._poll_new_files, daemon=True)
+            t.start()
+
+        def _poll_new_files(self) -> None:
+            seen = {str(e.src) for e in self.queue}
+            try:
+                while True:
+                    time.sleep(3)
+                    if self.cancelled:
+                        break
+                    new_files = find_files(self.inp_root, self.eff.get("recursive", False))
+                    for f in new_files:
+                        if str(f) not in seen:
+                            self.call_from_thread(self._add_new_file, f)
+                    seen = {str(e.src) for e in self.queue}
+            except Exception:
+                pass
+
+        def _add_new_file(self, src: Path) -> None:
+            entry = _QueueEntry(src)
+            dst = output_path_for(src, self.inp_root, self.output_dir)
+            entry.dst = str(dst)
+            if dst.exists():
+                entry.status = FileState.SKIPPED_EXISTS
+            self.queue.append(entry)
+            self._render_file_list()
+
+        def build_queue(self) -> None:
+            for src in self.files_init:
+                entry = _QueueEntry(src)
+                if self.eff["resume"]:
+                    prev = self.prev_files.get(str(src), {})
+                    if prev.get("status") == FileState.DONE:
+                        entry.status = FileState.SKIPPED_EXISTS
+                    elif prev.get("status") in (FileState.RUNNING, FileState.PAUSED):
+                        dst = output_path_for(src, self.inp_root, self.output_dir)
+                        if dst.exists():
+                            dst.unlink()
+                if entry.status == FileState.PENDING:
+                    dst = output_path_for(src, self.inp_root, self.output_dir)
+                    entry.dst = str(dst)
+                    if not self.eff["resume"] and dst.exists():
+                        entry.status = FileState.SKIPPED_EXISTS
+                self.queue.append(entry)
+
+        def _run_worker_thread(self) -> None:
+            self.running = True
+            t = threading.Thread(target=self._process_queue, daemon=True)
+            t.start()
+
+        def _process_queue(self) -> None:
+            idx = 0
+            while idx < len(self.queue):
+                if self.cancelled:
+                    break
+                entry = self.queue[idx]
+                if entry.status in (FileState.SKIPPED_EXISTS, FileState.SKIPPED_DOVI):
+                    self.call_from_thread(self._on_file_done, idx)
+                    idx += 1
+                    continue
+
+                self.current_idx = idx
+                entry.status = FileState.RUNNING
+
+                dst = Path(entry.dst) if entry.dst else output_path_for(
+                    entry.src, self.inp_root, self.output_dir)
+                if not entry.dst:
+                    entry.dst = str(dst)
+
+                self.call_from_thread(self._on_file_running, idx)
+
+                prev_frame = 0
+                def on_progress(prog: ConversionProgress) -> None:
+                    nonlocal prev_frame
+                    if prog.frame > prev_frame:
+                        prev_frame = prog.frame
+                        self.call_from_thread(self._on_progress_update, idx, prog)
+
+                try:
+                    row = convert_one(
+                        entry.src, dst, self.eff, self.audio_codec,
+                        self.sfile, self.lfile,
+                        on_progress=on_progress,
+                        pause_event=self.pause_event)
+
+                    entry.status = row.get("status", FileState.FAILED)
+                    entry.classification = row.get("classification", "")
+                    entry.encoder_key = row.get("encoder_key", "")
+                    entry.has_dovi = row.get("has_dovi", False)
+                    entry.is_hdr = row.get("is_hdr", False)
+                    entry.elapsed_sec = row.get("elapsed_sec", 0.0)
+
+                except Exception as exc:
+                    entry.status = FileState.FAILED
+                    entry.error = str(exc)
+
+                self.call_from_thread(self._on_file_done, idx)
+                idx += 1
+
+            self.current_idx = -1
+            self.running = False
+            self.call_from_thread(self._on_batch_done)
+
+        def _on_file_running(self, idx: int) -> None:
+            entry = self.queue[idx]
+            try:
+                meta = ffprobe_json(self.eff["ffprobe_bin"], entry.src)
+                plan = build_plan(meta, self.eff)
+                entry.classification = plan["classification"]
+                entry.encoder_key = plan["encoder_key"]
+                entry.has_dovi = plan["has_dovi"]
+                entry.is_hdr = plan["is_hdr"]
+
+                video_stream = plan.get("video", {})
+                fps_str = video_stream.get("r_frame_rate", "25/1")
+                if "/" in fps_str:
+                    num, den = fps_str.split("/")
+                    try:
+                        est_fps = float(num) / max(1, int(den))
+                    except ValueError:
+                        est_fps = 25.0
+                else:
+                    try:
+                        est_fps = float(fps_str)
+                    except ValueError:
+                        est_fps = 25.0
+
+                duration_str = meta.get("format", {}).get("duration", "0")
+                self.total_frames = max(1, int(float(duration_str) * est_fps))
+
+            except Exception:
+                self.total_frames = 100000
+
+            entry.status = FileState.RUNNING
+            self.progress = ConversionProgress()
+            self._render_file_list()
+            self._set_detail(entry)
+
+        def _on_progress_update(self, idx: int, prog: ConversionProgress) -> None:
+            pct = progress_pct(prog, self.total_frames) if self.total_frames else 0.0
+            bar = self.query_one(ProgressBarTui)
+            bar.update(total=max(self.total_frames, 1), progress=prog.frame)
+
+            self.query_one("#metric-fps").update(
+                f"    FPS: {prog.fps:.1f}  |  Speed: {prog.speed:.2f}x")
+            self.query_one("#metric-speed").update(
+                f"    Bitrate: {prog.bitrate_kbps:.0f} kbps  |  "
+                f"Frames: {prog.frame}")
+
+            entry = self.queue[idx] if 0 <= idx < len(self.queue) else None
+            if entry and hasattr(entry, "_start_time"):
+                base = Path(entry.src).name.rsplit(".", 1)[0]
+                elapsed = time.time() - entry._start_time
+                eta = estimate_total_time(elapsed, prog)
+                self.query_one("#stats-header").update(
+                    f"  {base}\n"
+                    f"  Elapsed: {format_time(elapsed)}  |  ETA: {eta}")
+
+        def _on_file_done(self, idx: int) -> None:
+            entry = self.queue[idx]
+            self._render_file_list()
+
+            if not INTERRUPTED:
+                self.current_idx = -1
+                if entry.status in (FileState.DONE, FileState.SKIPPED_EXISTS):
+                    self._set_done(entry)
+                elif entry.status == FileState.FAILED:
+                    self._set_failed(entry)
+
+        def _on_batch_done(self) -> None:
+            results = []
+            for entry in self.queue:
+                row = {
+                    "src": str(entry.src),
+                    "dst": entry.dst,
+                    "status": entry.status,
+                    "classification": entry.classification,
+                    "encoder_key": entry.encoder_key,
+                    "has_dovi": entry.has_dovi,
+                    "is_hdr": entry.is_hdr,
+                }
+                if entry.elapsed_sec:
+                    row["elapsed_sec"] = round(entry.elapsed_sec, 2)
+                results.append(row)
+
+            write_reports(self.root, results, self.eff)
+
+            done = sum(1 for e in self.queue if e.status == FileState.DONE)
+            failed = sum(1 for e in self.queue if e.status == FileState.FAILED)
+            skipped = sum(1 for e in self.queue if e.status.startswith("skipped"))
+            total = len(self.queue)
+            banner = self.query_one("#queue-banner")
+            if failed:
+                banner.update(f"  {done}/{total} done  |  {failed} failed  |  {skipped} skipped")
+                banner.classes = "file-failed"
+            else:
+                banner.update(f"  {done}/{total} done  |  {skipped} skipped")
+                banner.classes = "file-done"
+
+            self.query_one("#stats-header").update("  BATCH COMPLETE")
+
+        def _render_file_list(self) -> None:
+            widgets = []
+            for i, entry in enumerate(self.queue):
+                status_icon = {
+                    FileState.PENDING: "•  ",
+                    FileState.QUEUED: "◌  ",
+                    FileState.RUNNING: "▶  ",
+                    FileState.PAUSED: "▌  ",
+                    FileState.DONE: "✓   ",
+                    FileState.SKIPPED_EXISTS: "⊘  ",
+                    FileState.SKIPPED_DOVI: "⊘  ",
+                    FileState.FAILED: "✗   ",
+                }.get(entry.status, "?  ")
+
+                name = Path(entry.src).name.rsplit(".", 1)[0]
+                if i == self.current_idx:
+                    line = f"[bold cyan]{status_icon}{name}[/]"
+                else:
+                    cls = {
+                        FileState.DONE: "file-done",
+                        FileState.FAILED: "file-failed",
+                        FileState.PAUSED: "file-paused",
+                        FileState.RUNNING: "file-running",
+                    }.get(entry.status, "file-pending")
+                    line = f"[{cls}]{status_icon}{name}[/]"
+
+                widgets.append(Label(line))
+
+            done = sum(1 for e in self.queue if e.status == FileState.DONE)
+            failed = sum(1 for e in self.queue if e.status == FileState.FAILED)
+            skipped = sum(1 for e in self.queue if e.status.startswith("skipped"))
+            total = len(self.queue)
+
+            fl = self.query_one("#file-list")
+            for w in list(fl.children):
+                w.remove()
+            for w in widgets:
+                fl.mount(w)
+
+            banner = self.query_one("#queue-banner")
+            if failed:
+                banner.update(f"  {done}/{total} done  |  {failed} failed  |  {skipped} skipped")
+                banner.classes = "file-failed"
+            else:
+                banner.update(f"  {done}/{total} done  |  {skipped} skipped")
+                banner.classes = "file-done"
+
+        def _set_detail(self, entry: _QueueEntry) -> None:
+            base = Path(entry.src).name.rsplit(".", 1)[0]
+            entry._start_time = time.time()
+
+            self.query_one("#stats-header").update(
+                f"  {base}\n"
+                f"  Elapsed: --:--  |  ETA: ?")
+
+            self.query_one("#detail-classification").update(
+                f"  Class: {entry.classification or '?'}\n"
+                f"  Encoder: {entry.encoder_key or '?'}")
+
+            bar = self.query_one(ProgressBarTui)
+            bar.update(total=1, progress=0)
+
+        def _set_done(self, entry: _QueueEntry) -> None:
+            base = Path(entry.src).name.rsplit(".", 1)[0]
+            self.query_one("#stats-header").update(
+                f"  ✓ {base}\n"
+                f"  Completed in {format_time(entry.elapsed_sec)}")
+
+        def _set_failed(self, entry: _QueueEntry) -> None:
+            base = Path(entry.src).name.rsplit(".", 1)[0]
+            err = (entry.error or "")[:80]
+            self.query_one("#stats-header").update(
+                f"  ✗ {base}\n"
+                f"  Failed: {err}")
+
+        def action_pause_resume(self) -> None:
+            if not self.running or self.current_idx < 0:
+                return
+            entry = self.queue[self.current_idx]
+
+            if self.pause_event.is_set():
+                self.pause_event.clear()
+                entry.status = FileState.RUNNING
+                self.query_one("#pause-overlay").remove_class("visible")
+                update_file_state(self.sfile, entry.src, Path(entry.dst), FileState.RUNNING)
+            else:
+                self.pause_event.set()
+                entry.status = FileState.PAUSED
+                self.query_one("#pause-overlay").add_class("visible")
+                update_file_state(self.sfile, entry.src, Path(entry.dst), FileState.PAUSED)
+
+            self._render_file_list()
+
+        def action_quit(self) -> None:
+            if self.running and CURRENT_PROC and CURRENT_PROC.poll() is None:
+                try:
+                    os.kill(CURRENT_PROC.pid, signal.SIGSTOP)
+                except Exception:
+                    pass
+
+            self.cancelled = True
+            global INTERRUPTED
+            INTERRUPTED = True
+
+            if self.current_idx >= 0:
+                entry = self.queue[self.current_idx]
+                if entry.status == FileState.RUNNING:
+                    update_file_state(self.sfile, entry.src, Path(entry.dst), "interrupted")
+
+            self.exit()
+
+        def action_restart_file(self) -> None:
+            if self.current_idx < 0:
+                return
+            entry = self.queue[self.current_idx]
+            if entry.dst and Path(entry.dst).exists():
+                Path(entry.dst).unlink()
+            entry.status = FileState.PENDING
+
+    return _CuratorTui
+
+
+def run_tui(inp_root: Path, files: List[Path], output_dir: Optional[Path],
+            root: Path, sfile: Path, lfile: Path, eff: Dict[str, Any],
+            audio_codec: str, prev_files: Dict[str, Any]) -> int:
+    """Launch the TUI and return exit code after it closes."""
+    CuratorTuiCls = _make_tui_app()
+    app = CuratorTuiCls(inp_root, files, output_dir, root, sfile, lfile, eff, audio_codec, prev_files)
+    app.run()
+
+    if INTERRUPTED:
+        print("Interrupted by user — use --resume to continue.", file=sys.stderr)
+        return 130
+
+    failed = sum(1 for e in app.queue if e.status == FileState.FAILED)
+    return 1 if failed else 0
+
+
 def main() -> int:
     signal.signal(signal.SIGINT, handle_interrupt)
     parser = argparse.ArgumentParser(prog=f"{APP_NAME} {APP_VERSION}", description="Curate MKV files into HEVC-only M4V outputs with configurable DOVI policy and terminal/JSON reports.")
@@ -572,6 +1300,7 @@ def main() -> int:
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--plain", action="store_true", help="Use plain terminal output instead of TUI")
     parser.add_argument("--ffmpeg-bin", default=None)
     parser.add_argument("--ffprobe-bin", default=None)
     parser.add_argument("--vt-quality", type=int, default=None)
@@ -607,91 +1336,85 @@ def main() -> int:
     if not ffmpeg_ok:
         print(f"ffmpeg not found: {eff['ffmpeg_bin']}", file=sys.stderr); return 2
     if not ffprobe_ok:
-        print(f"ffprobe not found: {eff['ffprobe_bin']}", file=sys.stderr); return 2
+        print(f"ffprobe_bin not found: {eff['ffprobe_bin']}", file=sys.stderr); return 2
 
     inp = Path(args.input)
     output_dir = Path(eff["output_dir"]) if eff["output_dir"] else None
     root = output_root_for(inp, output_dir)
     root.mkdir(parents=True, exist_ok=True)
     sfile = state_file(root); lfile = log_file(root)
+
+    # Read existing state for resume
+    prev_state = read_state(sfile) if eff["resume"] else {"files": {}}
+    prev_files: Dict[str, Any] = prev_state.get("files", {})
+
     files = find_files(inp, eff["recursive"])
     if not files:
         print("No MKV files found", file=sys.stderr); return 1
 
+    if eff["use_tui"]:
+        # TUI mode
+        return run_tui(inp, files, output_dir, root, sfile, lfile, eff, args.audio_codec, prev_files)
+
+    # Plain mode
     failures = 0
     results = []
     for src in files:
         if INTERRUPTED:
             break
-        started = time.time()
-        row = {"src": str(src), "ts_start": now_iso()}
-        try:
-            dst = output_path_for(src, inp, output_dir)
-            row["dst"] = str(dst)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists():
-                row.update({"status": "skipped_exists"})
-                update_file_state(sfile, src, dst, "skipped_exists")
-                append_log(lfile, {"event": "skipped_exists", "src": str(src), "dst": str(dst)})
-                print(f"SKIP existing output: {dst}")
-                results.append(row)
-                continue
 
+        dst = output_path_for(src, inp, output_dir)
+
+        # Resume logic: skip completed files from previous session
+        prev_entry = prev_files.get(str(src), {})
+        if eff["resume"] and prev_entry.get("status") == FileState.DONE:
+            row = {"src": str(src), "dst": str(dst), "status": FileState.SKIPPED_EXISTS}
+            print(f"SKIP (resumed, previously done): {dst}")
+            results.append(row)
+            continue
+
+        # Clean up corrupt output if previous session crashed here
+        if eff["resume"] and prev_entry.get("status") in (FileState.RUNNING, FileState.PAUSED):
+            if dst.exists():
+                print(f"Removing corrupt output from previous crash: {dst}")
+                dst.unlink()
+
+        # Skip if already done (output exists)
+        if not eff["resume"] and dst.exists():
+            row = {"src": str(src), "dst": str(dst), "status": FileState.SKIPPED_EXISTS}
+            update_file_state(sfile, src, dst, FileState.SKIPPED_EXISTS)
+            append_log(lfile, {"event": "skipped_exists", "src": str(src), "dst": str(dst)})
+            print(f"SKIP existing output: {dst}")
+            results.append(row)
+            continue
+
+        try:
             meta = ffprobe_json(eff["ffprobe_bin"], src)
             plan = build_plan(meta, eff)
-            row.update({"classification": plan['classification'], "encoder_key": plan['encoder_key'], "has_dovi": plan['has_dovi'], "is_hdr": plan['is_hdr']})
+
             for line in report_lines(src, dst, plan, eff):
                 print(line)
 
-            if plan["encoder_key"] == "skip":
-                row.update({"status": "skipped_dovi_policy", "warning": "DOVI file skipped by policy"})
-                update_file_state(sfile, src, dst, "skipped_dovi_policy", {"classification": plan['classification'], "encoder_key": plan['encoder_key']})
-                append_log(lfile, {"event": "skipped_dovi_policy", "src": str(src), "dst": str(dst), "classification": plan['classification']})
-                results.append(row)
-                continue
-
-            cmd = build_cmd(eff["ffmpeg_bin"], src, dst, plan, args.audio_codec, eff)
-            append_log(lfile, {"event": "planned", "src": str(src), "dst": str(dst), "classification": plan['classification'], "encoder_key": plan['encoder_key'], "effective": eff})
-            update_file_state(sfile, src, dst, "planned", {"classification": plan['classification'], "encoder_key": plan['encoder_key'], "effective": eff})
             if eff["dry_run"]:
+                cmd = build_cmd(eff["ffmpeg_bin"], src, dst, plan, args.audio_codec, eff)
                 print("  Planned command:")
                 print("   ", " ".join(cmd)); print()
-                row.update({"status": "planned"})
+                row = {"src": str(src), "dst": str(dst), "status": "planned"}
                 results.append(row)
                 continue
 
-            update_file_state(sfile, src, dst, "running")
-            append_log(lfile, {"event": "running", "src": str(src), "dst": str(dst)})
-            global CURRENT_SRC, CURRENT_DST, CURRENT_PROC, CURRENT_STATE_PATH, CURRENT_LOG_PATH
-            CURRENT_SRC = str(src); CURRENT_DST = str(dst); CURRENT_STATE_PATH = sfile; CURRENT_LOG_PATH = lfile
-            CURRENT_PROC = subprocess.Popen(cmd)
-            rc = CURRENT_PROC.wait(); CURRENT_PROC = None
-            if INTERRUPTED:
-                break
-            if rc != 0:
-                failures += 1
-                row.update({"status": "failed", "returncode": rc})
-                update_file_state(sfile, src, dst, "failed", {"returncode": rc})
-                append_log(lfile, {"event": "failed", "src": str(src), "dst": str(dst), "returncode": rc})
-                print(f"FAILED: {src}", file=sys.stderr)
-            else:
-                row.update({"status": "done", "output_size_mb": sizeof_mb(dst)})
-                probe_out = ffprobe_json(eff["ffprobe_bin"], dst)
-                has_data_stream = any(s.get("codec_type") == "data" for s in probe_out.get("streams", []))
-                if has_data_stream:
-                    row["warning"] = "output still contains data stream"
-                update_file_state(sfile, src, dst, "done")
-                append_log(lfile, {"event": "done", "src": str(src), "dst": str(dst), "warning": row.get('warning')})
+            row = convert_one(src, dst, eff, args.audio_codec, sfile, lfile)
+            if row.get("status") == FileState.DONE:
                 print(f"WROTE: {dst}\n")
-            row["elapsed_sec"] = round(time.time() - started, 2)
-            row["ts_end"] = now_iso()
+            elif row.get("status") == FileState.FAILED:
+                failures += 1
+                print(f"FAILED: {src}", file=sys.stderr)
+
             results.append(row)
+
         except Exception as exc:
             failures += 1
-            row.update({"status": "failed", "error": str(exc), "elapsed_sec": round(time.time() - started, 2), "ts_end": now_iso()})
-            append_log(lfile, {"event": "error", "src": str(src), "error": str(exc)})
             print(f"FAILED: {src}: {exc}", file=sys.stderr)
-            results.append(row)
 
     report_path = write_reports(root, results, eff)
     summarize(results, report_path, eff["console_style"])
