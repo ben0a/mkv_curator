@@ -121,7 +121,11 @@ def load_toml(path: Path) -> Dict[str, Any]:
         return {}
     if tomllib is None:
         raise RuntimeError("Python tomllib unavailable; use Python 3.11+")
-    return tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Error reading config file {path}: {e}", file=sys.stderr)
+        raise SystemExit(2)
 
 
 def cfg_get(cfg: Dict[str, Any], section: str, key: str, default: Any = None) -> Any:
@@ -399,7 +403,11 @@ def report_json_file(root: Path, filename: str) -> Path:
 def read_state(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {"app": APP_NAME, "version": APP_VERSION, "updated_at": now_iso(), "files": {}}
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        print(f"Warning: could not read state file {path}; starting fresh", file=sys.stderr)
+        return {"app": APP_NAME, "version": APP_VERSION, "updated_at": now_iso(), "files": {}}
 
 
 def write_state(path: Path, state: Dict[str, Any]) -> None:
@@ -711,16 +719,18 @@ def progress_pct(progress: ConversionProgress, total_frames: int) -> float:
         return 0.0
     return min(100.0, (progress.frame / total_frames) * 100.0)
 
-def estimate_total_time(elapsed_sec: float, progress: ConversionProgress) -> Optional[str]:
-    """Estimate total time remaining at current speed."""
+def estimate_total_time(elapsed_sec: float, progress: ConversionProgress, total_duration_sec: float) -> Optional[str]:
+    """Estimate remaining wall-clock time at current encoding speed."""
     if not progress.speed or progress.speed < 0.1:
         return "?"
-    if progress.speed <= 1:
+    processed = parse_time_str(progress.time_str)
+    remaining_video = max(0, total_duration_sec - processed)
+    if remaining_video <= 0 or progress.speed <= 0:
         return "?"
-    remaining = elapsed_sec / (progress.speed - 1)
-    if remaining > 99999:
+    remaining_wall = remaining_video / progress.speed
+    if remaining_wall > 99999:
         return "?"
-    return format_time(remaining)
+    return format_time(remaining_wall)
 
 
 def effective_settings(args, cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -927,6 +937,7 @@ def _make_tui_app():
             self.cancelled = False
             self.progress = ConversionProgress()
             self.total_frames: int = 0
+            self.total_duration_sec: float = 3600.0
             self.prev_files = prev_files
 
         def compose(self) -> ComposeResult:
@@ -986,17 +997,16 @@ def _make_tui_app():
         def build_queue(self) -> None:
             for src in self.files_init:
                 entry = _QueueEntry(src)
+                dst = output_path_for(src, self.inp_root, self.output_dir)
+                entry.dst = str(dst)
                 if self.eff["resume"]:
                     prev = self.prev_files.get(str(src), {})
                     if prev.get("status") == FileState.DONE:
                         entry.status = FileState.SKIPPED_EXISTS
                     elif prev.get("status") in (FileState.RUNNING, FileState.PAUSED):
-                        dst = output_path_for(src, self.inp_root, self.output_dir)
                         if dst.exists():
                             dst.unlink()
                 if entry.status == FileState.PENDING:
-                    dst = output_path_for(src, self.inp_root, self.output_dir)
-                    entry.dst = str(dst)
                     if not self.eff["resume"] and dst.exists():
                         entry.status = FileState.SKIPPED_EXISTS
                 self.queue.append(entry)
@@ -1025,6 +1035,13 @@ def _make_tui_app():
                 if not entry.dst:
                     entry.dst = str(dst)
 
+                if self.eff.get("dry_run"):
+                    entry.status = "planned"
+                    entry.dst = str(dst)
+                    self.call_from_thread(self._on_file_done, idx)
+                    idx += 1
+                    continue
+
                 # Run ffprobe in worker thread to avoid blocking the UI
                 try:
                     meta = ffprobe_json(self.eff["ffprobe_bin"], entry.src)
@@ -1037,12 +1054,14 @@ def _make_tui_app():
                     else:
                         est_fps = float(fps_str) if fps_str else 25.0
                     duration_str = meta.get("format", {}).get("duration", "0")
-                    total_frames = max(1, int(float(duration_str) * est_fps))
+                    total_duration_sec = float(duration_str) if duration_str else 3600.0
+                    total_frames = max(1, int(total_duration_sec * est_fps))
                 except Exception:
                     meta = plan = None
                     total_frames = 100000
+                    total_duration_sec = 3600.0
 
-                self.call_from_thread(self._on_file_running, idx, plan, total_frames)
+                self.call_from_thread(self._on_file_running, idx, plan, total_frames, total_duration_sec)
 
                 prev_frame = 0
                 def on_progress(prog: ConversionProgress, _idx: int = idx) -> None:
@@ -1077,7 +1096,7 @@ def _make_tui_app():
             self.running = False
             self.call_from_thread(self._on_batch_done)
 
-        def _on_file_running(self, idx: int, plan: Optional[dict], total_frames: int) -> None:
+        def _on_file_running(self, idx: int, plan: Optional[dict], total_frames: int, total_duration_sec: float) -> None:
             entry = self.queue[idx]
             if plan:
                 entry.classification = plan.get("classification", "")
@@ -1085,6 +1104,7 @@ def _make_tui_app():
                 entry.has_dovi = plan.get("has_dovi", False)
                 entry.is_hdr = plan.get("is_hdr", False)
             self.total_frames = max(1, total_frames)
+            self.total_duration_sec = total_duration_sec
             entry.status = FileState.RUNNING
             self.progress = ConversionProgress()
             self._set_detail(entry)
@@ -1105,7 +1125,7 @@ def _make_tui_app():
             if entry and hasattr(entry, "_start_time"):
                 base = Path(entry.src).name.rsplit(".", 1)[0]
                 elapsed = time.time() - entry._start_time
-                eta = estimate_total_time(elapsed, prog)
+                eta = estimate_total_time(elapsed, prog, self.total_duration_sec)
                 self.query_one("#stats-header").update(
                     f"  {base}\n"
                     f"  Elapsed: {format_time(elapsed)}  |  ETA: {eta}")
@@ -1404,7 +1424,7 @@ def main() -> int:
                 results.append(row)
                 continue
 
-            row = convert_one(src, dst, eff, args.audio_codec, sfile, lfile)
+            row = convert_one(src, dst, eff, args.audio_codec, sfile, lfile, meta=meta, plan=plan)
             if row.get("status") == FileState.DONE:
                 print(f"WROTE: {dst}\n")
             elif row.get("status") == FileState.FAILED:
@@ -1415,6 +1435,8 @@ def main() -> int:
 
         except Exception as exc:
             failures += 1
+            row = {"src": str(src), "dst": str(dst), "status": FileState.FAILED, "error": str(exc)}
+            results.append(row)
             print(f"FAILED: {src}: {exc}", file=sys.stderr)
 
     report_path = write_reports(root, results, eff)
