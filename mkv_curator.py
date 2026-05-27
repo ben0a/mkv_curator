@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 APP_NAME = "mkv_curator"
-APP_VERSION = "0.9"
+APP_VERSION = "1.0"
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / APP_NAME / "config.toml"
 TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "text", "mov_text"}
 BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "pgs", "dvd_subtitle", "xsub", "dvb_subtitle"}
@@ -863,6 +863,7 @@ def _make_tui_app():
     }
 
     #file-list {
+        height: 1fr;
         overflow-y: auto;
     }
 
@@ -946,6 +947,7 @@ def _make_tui_app():
             self.total_frames: int = 0
             self.total_duration_sec: float = 3600.0
             self.selected_idx: int = 0
+            self.manual_selection: bool = False
             self.prev_files = prev_files
 
         def compose(self) -> ComposeResult:
@@ -1130,6 +1132,8 @@ def _make_tui_app():
                 entry.is_hdr = plan.get("is_hdr", False)
             self.total_frames = max(1, total_frames)
             self.total_duration_sec = total_duration_sec
+            if not self.eff.get("dry_run") and not self.manual_selection:
+                self.selected_idx = idx
             entry.status = FileState.RUNNING
             self.progress = ConversionProgress()
             self._set_detail(entry)
@@ -1214,6 +1218,13 @@ def _make_tui_app():
 
         def _render_file_list(self) -> None:
             widgets = []
+            is_dry_run = self.eff.get("dry_run")
+            if self.queue:
+                self.selected_idx = max(0, min(self.selected_idx, len(self.queue) - 1))
+            if is_dry_run or self.manual_selection:
+                highlighted = self.selected_idx
+            else:
+                highlighted = self.current_idx if self.current_idx >= 0 else self.selected_idx
             for i, entry in enumerate(self.queue):
                 status_icon = {
                     FileState.PENDING: "•  ",
@@ -1228,8 +1239,6 @@ def _make_tui_app():
                 }.get(entry.status, "?  ")
 
                 name = Path(entry.src).name.rsplit(".", 1)[0]
-                is_dry_run = self.eff.get("dry_run")
-                highlighted = self.selected_idx if is_dry_run else self.current_idx
                 if i == highlighted:
                     line = f"[bold cyan]{status_icon}{name}[/]"
                 else:
@@ -1255,9 +1264,9 @@ def _make_tui_app():
             for w in widgets:
                 fl.mount(w)
 
-            if widgets and 0 <= self.selected_idx < len(widgets):
+            if widgets and 0 <= highlighted < len(widgets):
                 try:
-                    fl.scroll_to_widget(widgets[self.selected_idx], animate=False)
+                    fl.scroll_to_widget(widgets[highlighted], animate=False)
                 except Exception:
                     pass
 
@@ -1358,13 +1367,15 @@ def _make_tui_app():
             self.query_one("#detail-classification").update("\n".join(lines))
 
         def _select_file(self, delta: int) -> None:
-            if not self.eff.get("dry_run") or not self.queue:
+            if not self.queue:
                 return
             new_idx = self.selected_idx + delta
             if 0 <= new_idx < len(self.queue):
+                self.manual_selection = True
                 self.selected_idx = new_idx
                 self._render_file_list()
-                self._show_dryrun_detail()
+                if self.eff.get("dry_run"):
+                    self._show_dryrun_detail()
 
         def action_select_up(self) -> None:
             self._select_file(-1)

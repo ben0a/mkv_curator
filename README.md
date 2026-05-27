@@ -15,7 +15,7 @@ Main goals:
 
 ## Current Video Policy
 
-Default encoding policy in `v0.9`:
+Default encoding policy in `v1.0`:
 
 | Source type | Default action |
 |---|---|
@@ -115,7 +115,7 @@ Displays real-time encoding metrics for the current file:
 | `Space` | Pause / Resume current conversion (sends SIGSTOP/SIGCONT to FFmpeg) |
 | `q` or `Esc` | Quit batch (saves state; use `--resume` to continue) |
 | `r` | Restart the current file (deletes partial output, re-encodes) |
-| `↑` / `↓` | Navigate file list (dry-run mode) — shows per-file detail in right panel |
+| `↑` / `↓` | Navigate file list (dry-run and running mode). In dry-run, right panel shows per-file plan detail. |
 
 ### Dry-Run Mode
 When launched with `--dry-run`, the TUI enters an analysis-only mode:
@@ -155,4 +155,3 @@ A typical run generates:
 - mkv_curator_report.json & mkv_curator_report.jsonl (final summary of the batch).
 
 The JSON reports contain per-file metadata (source, output, detected class like hdr_4k_dovi, chosen policy, conversion status, output size, elapsed time, and warnings) making it easy to parse the results later with other tools.
-
