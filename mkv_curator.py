@@ -849,6 +849,10 @@ def _make_tui_app():
         content-align: center middle;
     }
 
+    #file-list {
+        overflow-y: auto;
+    }
+
     #stats-header {
         height: auto;
         margin-bottom: 1;
@@ -880,6 +884,7 @@ def _make_tui_app():
     .file-paused { color: yellow; text-style: bold; }
     .file-running { color: cyan; text-style: bold; }
     .file-pending { color: $text-muted; }
+    .file-planned { color: $text-muted; }
 
     #pause-overlay {
         display: none;
@@ -929,7 +934,8 @@ def _make_tui_app():
             yield Header()
             with Container(id="left-panel"):
                 yield Label("  FILES TO PROCESS", id="left-title")
-                yield Static("", id="file-list")
+                with Container(id="file-list"):
+                    pass
                 yield Label("", id="queue-banner", classes="file-pending")
             with Container(id="right-panel"):
                 yield Label("  PAUSED — press Space to resume", id="pause-overlay")
@@ -1021,9 +1027,20 @@ def _make_tui_app():
                     entry.dst = str(dst)
 
                 if self.eff.get("dry_run"):
+                    try:
+                        meta = ffprobe_json(self.eff["ffprobe_bin"], entry.src)
+                        plan = build_plan(meta, self.eff)
+                        entry.classification = plan.get("classification", "?")
+                        entry.encoder_key = plan.get("encoder_key", "?")
+                        entry.has_dovi = plan.get("has_dovi", False)
+                        entry.is_hdr = plan.get("is_hdr", False)
+                    except Exception:
+                        plan = None
+                        entry.classification = "?"
+                        entry.encoder_key = "?"
                     entry.status = "planned"
                     entry.dst = str(dst)
-                    self.call_from_thread(self._on_file_done, idx)
+                    self.call_from_thread(self._on_file_planned, idx)
                     idx += 1
                     continue
 
@@ -1144,19 +1161,31 @@ def _make_tui_app():
 
             write_reports(self.root, results, self.eff)
 
+            is_dry_run = self.eff.get("dry_run", False)
             done = sum(1 for e in self.queue if e.status == FileState.DONE)
             failed = sum(1 for e in self.queue if e.status == FileState.FAILED)
             skipped = sum(1 for e in self.queue if e.status.startswith("skipped"))
+            planned = sum(1 for e in self.queue if e.status == "planned")
+            skipped_planned = sum(1 for e in self.queue if e.status in (FileState.SKIPPED_EXISTS, FileState.SKIPPED_DOVI))
             total = len(self.queue)
             banner = self.query_one("#queue-banner")
-            if failed:
+
+            if is_dry_run:
+                analysed = planned + skipped_planned
+                banner.update(f"  {analysed}/{total} files analysed  |  DRY-RUN COMPLETE")
+                banner.classes = "file-done"
+                self.query_one("#stats-header").update(
+                    "  DRY-RUN COMPLETE\n"
+                    "  JSON reports written. Re-run without --dry-run to convert.")
+            elif failed:
                 banner.update(f"  {done}/{total} done  |  {failed} failed  |  {skipped} skipped")
                 banner.classes = "file-failed"
             else:
                 banner.update(f"  {done}/{total} done  |  {skipped} skipped")
                 banner.classes = "file-done"
 
-            self.query_one("#stats-header").update("  BATCH COMPLETE")
+            if not is_dry_run:
+                self.query_one("#stats-header").update("  BATCH COMPLETE")
 
         def _render_file_list(self) -> None:
             widgets = []
@@ -1170,6 +1199,7 @@ def _make_tui_app():
                     FileState.SKIPPED_EXISTS: "⊘  ",
                     FileState.SKIPPED_DOVI: "⊘  ",
                     FileState.FAILED: "✗   ",
+                    "planned": "○  ",
                 }.get(entry.status, "?  ")
 
                 name = Path(entry.src).name.rsplit(".", 1)[0]
@@ -1181,6 +1211,7 @@ def _make_tui_app():
                         FileState.FAILED: "file-failed",
                         FileState.PAUSED: "file-paused",
                         FileState.RUNNING: "file-running",
+                        "planned": "file-planned",
                     }.get(entry.status, "file-pending")
                     line = f"[{cls}]{status_icon}{name}[/]"
 
@@ -1232,6 +1263,41 @@ def _make_tui_app():
             self.query_one("#stats-header").update(
                 f"  ✗ {base}\n"
                 f"  Failed: {err}")
+
+        def _on_file_planned(self, idx: int) -> None:
+            total = len(self.queue)
+            done = sum(1 for e in self.queue if e.status in ("planned", FileState.SKIPPED_EXISTS))
+
+            strategies: Dict[str, int] = {}
+            for e in self.queue:
+                if e.status == "planned":
+                    cls = e.classification or "?"
+                    strategies[cls] = strategies.get(cls, 0) + 1
+
+            lines = [
+                "  DRY-RUN MODE — re-run without --dry-run to convert",
+                f"  {'─' * 48}",
+                f"  Files found: {total}",
+            ]
+
+            strat_labels = {
+                "sdr_1080p":    "SDR 1080p     → HEVC 8-bit",
+                "sdr_4k":       "SDR 4K        → HEVC 8-bit",
+                "hdr_4k":       "HDR 4K        → HEVC 10-bit",
+                "hdr_hd":       "HDR HD        → HEVC 10-bit",
+                "hdr_4k_dovi":  "HDR 4K DOVI   → policy",
+                "hdr_hd_dovi":  "HDR HD DOVI   → policy",
+            }
+
+            for cls, label in strat_labels.items():
+                if strategies.get(cls):
+                    lines.append(f"  {label}: {strategies[cls]}")
+
+            if strategies.get("?"):
+                lines.append(f"  Unknown (probe failed): {strategies['?']}")
+
+            self.query_one("#stats-header").update("\n".join(lines))
+            self._render_file_list()
 
         def action_pause_resume(self) -> None:
             if not self.running or self.current_idx < 0:
