@@ -30,14 +30,15 @@ CURRENT_PROC: Optional[subprocess.Popen] = None
 CURRENT_STATE_PATH: Optional[Path] = None
 CURRENT_LOG_PATH: Optional[Path] = None
 
-# Regex to parse FFmpeg progress line from stderr
-FFMPEG_PROGRESS_RE = re.compile(
-    r"frame=(\d+)\s+fps=([\d.]+)\s+q=(-?\d+\.\d+|-?\d)\s+"
-    r"(?:size=\s*(\d+)KiB\s*)?"
-    r"time=(\d+:\d+:\d+\.\d+)\s*"
-    r"bitrate=\s*([\d.]+|N/A)\s*kbits/s\s*"
-    r"(?:speed=\s*([\d.]+|N/A)\s*x)?"
-)
+# Tolerant token regexes to parse FFmpeg progress lines from stderr.
+# FFmpeg output varies across encoders/builds (spacing, N/A values, kB units),
+# so we parse fields independently instead of matching a strict full-line pattern.
+FF_FRAME_RE = re.compile(r"\bframe=\s*(\d+)")
+FF_FPS_RE = re.compile(r"\bfps=\s*([\d.]+)")
+FF_SIZE_RE = re.compile(r"\bsize=\s*(\d+)\s*kB\b")
+FF_TIME_RE = re.compile(r"\btime=\s*(\d+:\d+:\d+\.\d+)")
+FF_BITRATE_RE = re.compile(r"\bbitrate=\s*([\d.]+)\s*kbits/s\b")
+FF_SPEED_RE = re.compile(r"\bspeed=\s*([\d.]+)\s*x\b")
 
 # Progress data passed to callbacks
 class ConversionProgress:
@@ -515,19 +516,31 @@ def report_lines(src: Path, dst: Path, plan: Dict[str, Any], eff: Dict[str, Any]
 
 
 def parse_progress_line(line: str, progress: ConversionProgress) -> None:
-    m = FFMPEG_PROGRESS_RE.search(line.strip())
-    if not m:
-        return
-    progress.frame = int(m.group(1))
-    progress.fps = float(m.group(2))
-    if m.group(4):
-        progress.size_kib = int(m.group(4))
-    if m.group(5):
-        progress.time_str = m.group(5)
-    if m.group(6) and m.group(6) != "N/A":
-        progress.bitrate_kbps = float(m.group(6))
-    if m.group(7) and m.group(7) != "N/A":
-        progress.speed = float(m.group(7))
+    text = line.strip()
+
+    m = FF_FRAME_RE.search(text)
+    if m:
+        progress.frame = int(m.group(1))
+
+    m = FF_FPS_RE.search(text)
+    if m:
+        progress.fps = float(m.group(1))
+
+    m = FF_SIZE_RE.search(text)
+    if m:
+        progress.size_kib = int(m.group(1))
+
+    m = FF_TIME_RE.search(text)
+    if m:
+        progress.time_str = m.group(1)
+
+    m = FF_BITRATE_RE.search(text)
+    if m:
+        progress.bitrate_kbps = float(m.group(1))
+
+    m = FF_SPEED_RE.search(text)
+    if m:
+        progress.speed = float(m.group(1))
 
 def _read_ffmpeg_stderr(rd_fd: int, progress: ConversionProgress,
                          on_progress: Optional[Callable], pause_event: threading.Event) -> None:
@@ -539,7 +552,7 @@ def _read_ffmpeg_stderr(rd_fd: int, progress: ConversionProgress,
             chunk = os.read(rd_fd, 65536)
             if not chunk:
                 break
-            buf += chunk
+            buf += chunk.replace(b"\r", b"\n")
             while b"\n" in buf:
                 line_bytes, buf = buf.split(b"\n", 1)
                 try:
@@ -1078,7 +1091,7 @@ def _make_tui_app():
                 prev_frame = 0
                 def on_progress(prog: ConversionProgress, _idx: int = idx) -> None:
                     nonlocal prev_frame
-                    if prog.frame > prev_frame:
+                    if prog.frame >= prev_frame:
                         prev_frame = prog.frame
                         self.call_from_thread(self._on_progress_update, _idx, prog)
 
