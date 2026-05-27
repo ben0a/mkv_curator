@@ -904,6 +904,10 @@ def _make_tui_app():
             Binding("q", "quit", "Quit batch"),
             Binding("space", "pause_resume", "Pause / Resume"),
             Binding("r", "restart_file", "Restart current file"),
+            Binding("up", "select_up", "↑ File", show=False),
+            Binding("down", "select_down", "↓ File", show=False),
+            Binding("k", "select_up", "", show=False),
+            Binding("j", "select_down", "", show=False),
         ]
 
         CSS = CSS_CODE
@@ -928,6 +932,7 @@ def _make_tui_app():
             self.progress = ConversionProgress()
             self.total_frames: int = 0
             self.total_duration_sec: float = 3600.0
+            self.selected_idx: int = 0
             self.prev_files = prev_files
 
         def compose(self) -> ComposeResult:
@@ -954,6 +959,11 @@ def _make_tui_app():
             self.build_queue()
             self.query_one("#left-panel").styles.height = "100%"
             self.query_one("#right-panel").styles.height = "100%"
+            if self.eff.get("dry_run"):
+                self.query_one("#progress-section").display = False
+                self.query_one("#metrics-section").display = False
+                self.query_one("#detail-classification").update(
+                    "  ↑/↓ to browse files")
             self._start_file_watcher()
             self._run_worker_thread()
 
@@ -1172,11 +1182,13 @@ def _make_tui_app():
 
             if is_dry_run:
                 analysed = planned + skipped_planned
+                dovi_total = sum(1 for e in self.queue if e.has_dovi)
                 banner.update(f"  {analysed}/{total} files analysed  |  DRY-RUN COMPLETE")
                 banner.classes = "file-done"
-                self.query_one("#stats-header").update(
-                    "  DRY-RUN COMPLETE\n"
-                    "  JSON reports written. Re-run without --dry-run to convert.")
+                msg = "  DRY-RUN COMPLETE\n  JSON reports written. ↑/↓ to browse files."
+                if dovi_total:
+                    msg = f"  DRY-RUN COMPLETE — {dovi_total} DOVI files\n  JSON reports written. Re-run without --dry-run to convert."
+                self.query_one("#stats-header").update(msg)
             elif failed:
                 banner.update(f"  {done}/{total} done  |  {failed} failed  |  {skipped} skipped")
                 banner.classes = "file-failed"
@@ -1203,7 +1215,9 @@ def _make_tui_app():
                 }.get(entry.status, "?  ")
 
                 name = Path(entry.src).name.rsplit(".", 1)[0]
-                if i == self.current_idx:
+                is_dry_run = self.eff.get("dry_run")
+                highlighted = self.selected_idx if is_dry_run else self.current_idx
+                if i == highlighted:
                     line = f"[bold cyan]{status_icon}{name}[/]"
                 else:
                     cls = {
@@ -1227,6 +1241,12 @@ def _make_tui_app():
                 w.remove()
             for w in widgets:
                 fl.mount(w)
+
+            if widgets and 0 <= self.selected_idx < len(widgets):
+                try:
+                    fl.scroll_to_widget(widgets[self.selected_idx], animate=False)
+                except Exception:
+                    pass
 
             banner = self.query_one("#queue-banner")
             if failed:
@@ -1269,10 +1289,13 @@ def _make_tui_app():
             done = sum(1 for e in self.queue if e.status in ("planned", FileState.SKIPPED_EXISTS))
 
             strategies: Dict[str, int] = {}
+            dovi_count = 0
             for e in self.queue:
                 if e.status == "planned":
                     cls = e.classification or "?"
                     strategies[cls] = strategies.get(cls, 0) + 1
+                    if e.has_dovi:
+                        dovi_count += 1
 
             lines = [
                 "  DRY-RUN MODE — re-run without --dry-run to convert",
@@ -1296,8 +1319,45 @@ def _make_tui_app():
             if strategies.get("?"):
                 lines.append(f"  Unknown (probe failed): {strategies['?']}")
 
+            if dovi_count:
+                lines.append(f"  Dolby Vision files: {dovi_count}")
+
             self.query_one("#stats-header").update("\n".join(lines))
+            self.selected_idx = min(self.selected_idx, len(self.queue) - 1)
             self._render_file_list()
+            self._show_dryrun_detail()
+
+        def _show_dryrun_detail(self) -> None:
+            if not self.eff.get("dry_run") or not self.queue:
+                return
+            idx = min(self.selected_idx, len(self.queue) - 1)
+            entry = self.queue[idx]
+            base = Path(entry.src).name.rsplit(".", 1)[0]
+
+            lines = [
+                f"  File: {base}",
+                f"  {'─' * 48}",
+                f"  Class:    {entry.classification or '?'}",
+                f"  Encoder:  {entry.encoder_key or '?'}",
+                f"  DOVI:     {'Yes' if entry.has_dovi else 'No'}",
+                f"  HDR:      {'Yes' if entry.is_hdr else 'No'}",
+            ]
+            self.query_one("#detail-classification").update("\n".join(lines))
+
+        def _select_file(self, delta: int) -> None:
+            if not self.eff.get("dry_run") or not self.queue:
+                return
+            new_idx = self.selected_idx + delta
+            if 0 <= new_idx < len(self.queue):
+                self.selected_idx = new_idx
+                self._render_file_list()
+                self._show_dryrun_detail()
+
+        def action_select_up(self) -> None:
+            self._select_file(-1)
+
+        def action_select_down(self) -> None:
+            self._select_file(1)
 
         def action_pause_resume(self) -> None:
             if not self.running or self.current_idx < 0:
